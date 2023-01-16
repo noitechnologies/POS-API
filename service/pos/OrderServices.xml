@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"  xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-2.1.xsd">
+
+    <service verb="cancel" noun="Order">
+        <in-parameters>
+            <parameter name="orderId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="code"/>
+            <parameter name="statusChanged"/>
+        </out-parameters>
+        <actions>
+            <service-call name="mantle.order.OrderServices.cancel#Order" in-map="[orderId: orderId]" out-map="outMap"/>
+            <if condition="outMap &amp;&amp; outMap.statusChanged==true">
+                <set field="code" type="Integer" value="200"/>
+                <set field="statusChanged" type="Boolean" value="true"/>
+                <else>
+                    <set field="statusChanged" type="Boolean" value="false"/>
+                </else>
+            </if>
+        </actions>
+    </service>
+
+    <service verb="check" noun="OrderForCancellation">
+        <description>Check if order cancellation is allowed</description>
+        <in-parameters>
+            <parameter name="orderId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="code"/>
+            <parameter name="result"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="mantle.order.OrderHeader" value-field="orderHeader" cache="false">
+                <field-map field-name="orderId"/>
+            </entity-find-one>
+            <entity-find entity-name="moqui.basic.StatusFlowTransition" list="statusFlowTransition">
+                <econdition field-name="statusId" from="orderHeader?.statusId"/>
+                <econdition field-name="toStatusId" value="OrderCancelled"/>
+            </entity-find>
+            <set field="result" from="[:]"/>
+            <if condition="statusFlowTransition">
+                <set field="result.cancellationAllowed" value="true" type="Boolean"/>
+                <else>
+                    <entity-find-one entity-name="moqui.basic.StatusItem" value-field="statusItem" cache="true">
+                        <field-map field-name="statusId" from="orderHeader?.statusId"/>
+                    </entity-find-one>
+                    <set field="result.reason" value="Can't cancel ${statusItem?.description} order."/>
+                    <set field="result.cancellationAllowed" value="false" type="Boolean"/>
+                </else>
+            </if>
+            <set field="code" value="200" type="Integer"/>
+        </actions>
+    </service>
+
+</services>

@@ -1,0 +1,203 @@
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-2.1.xsd">
+
+    <service verb="consume" noun="OfflineData">
+        <in-parameters>
+            <parameter name="orders" type="List"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="ordersInfoList" type="List"><parameter name="orderInfo" type="Map"/></parameter>
+        </out-parameters>
+        <actions>
+            <service-call name="create#moqui.service.message.SystemMessage" out-map="context" transaction="force-new"
+                          in-map="[statusId:'SmsgReceived', messageText: orders, isOutgoing:'N',docType: 'JSON',docSubType: 'OrderShipment',objectIdType: 'ObjOrder', initDate:ec.user.nowTimestamp]"/>
+            <if condition="systemMessageId">
+                <service-call name="pos.OfflineDataServices.store#OfflineData"
+                              in-map="[orders: orders]" out-map="context"/>
+            </if>
+        </actions>
+    </service>
+
+    <service verb="store" noun="OfflineData">
+        <in-parameters>
+            <parameter name="orders" type="List"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="ordersInfoList" type="List"><parameter name="orderInfo" type="Map">
+                <parameter name="partyId"/>
+                <parameter name="orderId"/>
+                <parameter name="orderPartSeqId"/>
+                <parameter name="paymentIds"/>
+            </parameter></parameter>
+        </out-parameters>
+        <actions>
+            <set field="ordersInfoList" from="[]"/>
+            <iterate list="orders" entry="order">
+                <set field="orderInfoMap" from="[:]"/>
+                <set field="customerData" from="order.customer"/>
+                <set field="shippingAddress" from="order.shippingAddress"/>
+                <set field="paymentMethodList" from="order.paymentMethodId"/>
+                <set field="salesChannelEnumId" value="ScPOS"/>
+
+                <if condition="!customerData.partyId">
+                    <service-call name="mantle.party.PartyServices.create#PersonCustomer" in-map="[partyId: customerData?.customer_id, firstName: customerData?.firstName, lastName: customerData?.lastName, postalContactMechPurposeId: 'PostalPrimary',
+                                        address1:customerData?.address1, address2: customerData?.address2, city:customerData?.city, telecomContactMechPurposeId: 'PhonePrimary', contactNumber:customerData?.phone,
+                                        emailContactMechPurposeId: 'EmailPrimary', emailAddress:customerData?.email, partyClassificationId: 'CustConsumer']" out-map="partyInfo"/>
+                </if>
+
+                <set field="partyId" from="customerData?.partyId ? customerData?.partyId : partyInfo?.partyId"/>
+
+                <service-call name="mantle.order.OrderServices.create#Order" in-map="[orderId: order?.orderId, customerPartyId: partyId, salesChannelEnumId: salesChannelEnumId, productStoreId: order?.productStoreId]" out-map="orderInfo"/>
+                <if condition="order.orderItems">
+                    <set field="orderItemsList" from="order.orderItems"/>
+                    <iterate list="orderItemsList" entry="orderItem">
+                        <service-call name="mantle.order.OrderServices.add#OrderProductQuantity" in-map="[orderId: orderInfo.orderId, orderPartSeqId: orderInfo.orderPartSeqId, productId: orderItem?.productId, quantity: orderItem?.quantity, unitAmount: orderItem?.amount, salesChannelEnumId: salesChannelEnumId]" out-map="ItemInfo"/>                    </iterate>
+                </if>
+
+                <!--Handle ItemShipping charge-->
+                <if condition="order.shippingAmount">
+                    <service-call name="mantle.order.OrderServices.create#OrderItem" in-map="[orderId: orderInfo.orderId, orderPartSeqId: orderInfo.orderPartSeqId, itemTypeEnumId: 'ItemShipping', unitAmount: order.shippingAmount]" out-map="ItemInfo"/>
+                </if>
+
+                <!-- Change order status from open to placed -->
+                <service-call name="mantle.order.OrderServices.place#Order" in-map="[orderId: orderInfo.orderId, orderPartSeqId: orderInfo.orderPartSeqId]" out-map="newOrder"/>
+
+                <!--check paymentMethod available for customer, if not than create new paymentMethod-->
+                <set field="paymentIds" from="[]"/>
+
+                <iterate list="paymentMethodList" entry="paymentMethod">
+                    <entity-find-one entity-name="mantle.account.method.PaymentMethod" value-field="paymentMethodInfo">
+                        <field-map field-name="paymentMethodTypeEnumId" from="paymentMethod.paymentMethodId"/>
+                        <field-map field-name="ownerPartyId" from="partyId"/>
+                    </entity-find-one>
+                    <if condition="paymentMethodInfo">
+                        <service-call name="mantle.order.OrderServices.add#OrderPartPayment" out-map="paymentInfo"
+                                      in-map="[orderId: orderInfo.orderId, orderPartSeqId: orderInfo.orderPartSeqId, paymentMethodId: paymentMethodInfo.paymentMethodId, amount: paymentMethod.amount]"/>
+                        <script>paymentIds.add(paymentInfo.paymentId)</script>
+                        <else>
+                            <service-call name="create#mantle.account.method.PaymentMethod" in-map="[ownerPartyId: partyId, paymentMethodTypeEnumId: paymentMethod.paymentMethodId, fromDate: ec.user.nowTimestamp, postalContactMechId: partyInfo?.postalContactMechId, telecomContactMechId: partyInfo?.telecomContactMechId]" out-map="paymentMethodId"/>
+                            <service-call name="mantle.order.OrderServices.add#OrderPartPayment" out-map="paymentInfo"
+                                          in-map="[orderId: orderInfo.orderId, orderPartSeqId: orderInfo.orderPartSeqId, paymentMethodId: paymentMethodId.paymentMethodId, amount: paymentMethod.amount]"/>
+                            <script>paymentIds.add(paymentInfo.paymentId)</script>
+                        </else>
+                    </if>
+                </iterate>
+
+
+                <if condition="order.isStoreDelivery == 'true'">
+                    <!--change order status from placed to Approved-->
+                    <service-call name="mantle.order.OrderServices.update#OrderStatus" in-map="[orderId: orderInfo.orderId, orderPartSeqId: orderInfo.orderPartSeqId, statusId: 'OrderApproved']" out-map="context"/>
+
+                    <!-- create a shipment -->
+                    <service-call name="mantle.shipment.ShipmentServices.create#OrderPartShipment" in-map="[orderId: orderInfo.orderId, orderPartSeqId: orderInfo.orderPartSeqId]" out-map="shipment"/>
+
+                    <!-- Pack shipment Item -->
+                    <entity-find entity-name="mantle.shipment.ShipmentItem" list="ItemsList">
+                        <econdition field-name="shipmentId" from="shipment.shipmentId"/>
+                    </entity-find>
+                    <iterate list="ItemsList" entry="Item">
+                        <service-call name="mantle.shipment.ShipmentServices.pack#ShipmentProduct" in-map="[shipmentId: shipment.shipmentId, productId: Item.productId, quantity: Item.quantity]" out-map="shipmentItem"/>
+                    </iterate>
+
+                    <!-- change shipment status from Input/scheduled to packed -->
+                    <service-call name="mantle.shipment.ShipmentServices.pack#Shipment" in-map="[shipmentId: shipment.shipmentId]"/>
+
+                    <!-- change sipment status from shipped to delivered -->
+                    <service-call name="mantle.shipment.ShipmentServices.deliver#Shipment" in-map="[shipmentId: shipment.shipmentId]"/>
+
+                    <!-- change order status from Approved to Completed -->
+                    <service-call name="mantle.order.OrderServices.complete#Order" in-map="[orderId: orderInfo.orderId]"/>
+
+                    <else>
+                        <service-call name="mantle.party.ContactServices.get#PartyContactInfo" in-map="[partyId: partyId,  postalContactMechPurposeId: 'PostalShippingDest']" out-map="partyContact"/>
+                        <set field="postalAddress" from="partyContact?.postalAddress"/>
+
+                        <if condition="postalAddress &amp;&amp; postalAddress != null">
+                            <service-call name="mantle.party.ContactServices.update#PartyPostalAddress" in-map="[firstName:shippingAddress?.firstName, lastName:shippingAddress?.lastName, contactNumber:shippingAddress?.phone, emailAddress:shippingAddress?.email, address1:shippingAddress?.address1,
+                                        address2: shippingAddress?.address2, city:shippingAddress?.city, countryCode:shippingAddress?.countryCode, areaCode:shippingAddress?.stateCode, postalCode: shippingAddress?.postalCode, partyId:partyId, contactMechId: postalAddress.contactMechId]" out-map="shippingInfo"/>
+                            <else>
+                                <service-call name="mantle.party.ContactServices.store#PartyContactInfo" in-map="[firstName:shippingAddress?.firstName, lastName:shippingAddress?.lastName, contactNumber:shippingAddress?.phone, emailAddress:shippingAddress?.email, address1:shippingAddress?.address1,
+                                        address2: shippingAddress?.address2, city:shippingAddress?.city, countryCode:shippingAddress?.countryCode, areaCode:shippingAddress?.stateCode, postalCode: shippingAddress?.postalCode, partyId:partyId, postalContactMechPurposeId: 'PostalShippingDest',
+                                        telecomContactMechPurposeId: 'PhoneShippingDest', emailContactMechPurposeId: 'EmailShippingDest']" out-map="shippingInfo"/>
+                            </else>
+                        </if>
+
+                        <if condition="shippingInfo">
+                            <service-call name="mantle.order.OrderServices.set#OrderBillingShippingInfo" in-map="[orderId: orderInfo.orderId, orderPartSeqId: orderInfo.orderPartSeqId, paymentId: paymentInfo.paymentId,
+                                        shippingPostalContactMechId: shippingInfo.postalContactMechId, shippingTelecomContactMechId: shippingInfo.telecomContactMechId, carrierPartyId:'_NA_', shipmentMethodEnumId:'ShMthGround']" out-map="billingShipping"/>
+
+                            <!--change order status from placed to Approved-->
+                            <service-call name="mantle.order.OrderServices.update#OrderStatus" in-map="[orderId: orderInfo.orderId, orderPartSeqId: orderInfo.orderPartSeqId, statusId: 'OrderApproved']" out-map="context"/>
+
+                            <!-- create a shipment -->
+                            <service-call name="mantle.shipment.ShipmentServices.create#OrderPartShipment" in-map="[orderId: orderInfo.orderId, orderPartSeqId: orderInfo.orderPartSeqId]" out-map="shipment"/>
+
+                            <!-- Pack shipment Item -->
+                            <entity-find entity-name="mantle.shipment.ShipmentItem" list="ItemsList">
+                                <econdition field-name="shipmentId" from="shipment.shipmentId"/>
+                            </entity-find>
+                            <iterate list="ItemsList" entry="Item">
+                                <service-call name="mantle.shipment.ShipmentServices.pack#ShipmentProduct" in-map="[shipmentId: shipment.shipmentId, productId: Item.productId, quantity: Item.quantity]" out-map="shipmentItem"/>
+                            </iterate>
+
+                            <!-- change shipment status from Input/scheduled to packed -->
+                            <service-call name="mantle.shipment.ShipmentServices.pack#Shipment" in-map="[shipmentId: shipment.shipmentId]"/>
+                        </if>
+                    </else>
+                </if>
+                <set field="orderInfoMap.partyId" from="partyId"/>
+                <set field="orderInfoMap.orderId" from="orderInfo.orderId"/>
+                <set field="orderInfoMap.orderPartSeqId" from="orderInfo.orderPartSeqId"/>
+                <set field="orderInfoMap.paymentIds" from="paymentIds"/>
+                <script>
+                    ordersInfoList.add(orderInfoMap)
+                </script>
+            </iterate>
+            <script>
+                String[] orderSeq = orders[0].orderId.split("-", 4);
+            </script>
+            <set field="productStoreId" from="orderSeq[0]"/>
+            <set field="loggedInPartyId" from="orderSeq[1]"/>
+            <set field="sequenceId"  type="Integer" from="orderSeq[3]"/>
+            <entity-find-one entity-name="OrderSequence" value-field="orderSequenceData">
+                <field-map field-name="productStoreId" from="productStoreId"/>
+                <field-map field-name="loggedInPartyId" from="loggedInPartyId"/>
+            </entity-find-one>
+            <if condition="!orderSequenceData">
+                <service-call name="create#pickerp.OrderSequence" in-map="[productStoreId:productStoreId, loggedInPartyId:loggedInPartyId,sequenceId:sequenceId]"/>
+                <else>
+                    <script>int orderSeqData=Integer.parseInt(orderSequenceData.sequenceId);</script>
+                    <if condition="sequenceId.equals(orderSeqData)">
+                        <script>sequenceId+=1;</script>
+                        <service-call name="update#pickerp.OrderSequence" in-map="[productStoreId:productStoreId, loggedInPartyId:loggedInPartyId,sequenceId:sequenceId]"/>
+                        <else>
+                            <service-call name="update#pickerp.OrderSequence" in-map="[productStoreId:productStoreId, loggedInPartyId:loggedInPartyId,sequenceId:sequenceId]"/>
+                        </else>
+                    </if>
+                </else>
+            </if>
+        </actions>
+    </service>
+
+    <service verb="get" noun="OrderSequenceNumber">
+        <in-parameters>
+            <parameter name="productStoreId" required="true"/>
+            <parameter name="partyId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="sequenceId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="OrderSequence" value-field="orderSequenceData">
+                <field-map field-name="productStoreId" from="productStoreId"/>
+                <field-map field-name="loggedInPartyId" from="partyId"/>
+            </entity-find-one>
+            <if condition="!orderSequenceData">
+                <set field="sequenceId" value="00000" type="Integer"/>
+                <else>
+                    <set field="sequenceId" from="orderSequenceData?.sequenceId"/>
+                </else>
+            </if>
+        </actions>
+    </service>
+</services>
